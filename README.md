@@ -1,115 +1,74 @@
 # Obelisk Reserve Protocol
 
-![banner](./assets/banner.png)
+![Obelisk Reserve Protocol](assets/banner.png)
 
-Obelisk Reserve Protocol es un sistema de emisión y redención para una
-stablecoin sobrecolateralizada. El protocolo mantiene posiciones de reserva,
-distribuye liquidez entre buckets operativos, procesa redenciones diferidas y
-permite recapitalización mediante un backstop pool.
+Obelisk Reserve Protocol implementa una stablecoin sobrecolateralizada, `oUSD`, con posiciones por activo, reservas distribuidas en buckets, redenciones diferidas y un fondo de respaldo. El código Solidity incluye controles de precio, límites de emisión, roles segregados y vistas de seguimiento. Esta entrega identifica una versión del repositorio; no acredita que los contratos estén desplegados en una red pública.
 
-## Componentes
+## Arquitectura
 
-- `ObeliskReservePool`: orquesta apertura de posiciones, mint, burn, retiradas,
-  liquidación de tickets de redención y recapitalización.
-- `ObeliskUSD`: stablecoin ERC-20 de 18 decimales con permisos de emisión y
-  soporte EIP-2612.
-- `ReserveRegistry`: registra activos, parámetros de riesgo, caps y pesos de
-  buckets.
-- `ReserveOracle`: publica precios normalizados a 18 decimales con heartbeat y
-  límites.
-- `DebtBook`: mantiene posiciones, colateral, deuda y agregados por activo.
-- `LiquidityBuckets`: separa reservas en buckets immediate, deferred, strategic
-  y backstop.
-- `RedemptionQueue`: custodia el flujo diferido de redenciones y batch
-  processing.
-- `BackstopPool`: recibe liquidez de respaldo y puede aportar fondos al reserve
-  pool.
-- `FeeController`: calcula y acumula comisiones operativas por activo.
-- `ReserveAccounting`: consolida actividad por epoch y cuenta.
-- `ObeliskLens`: agrega vistas operativas para dashboards y monitores.
-- `ParameterTimelock` y `KeeperRouter`: utilidades de gobierno y ejecución
-  operativa.
+```mermaid
+flowchart LR
+  U[Usuarios] -->|colateral / deuda| P[ObeliskReservePool]
+  P --> D[DebtBook]
+  P --> B[LiquidityBuckets]
+  P --> T[oUSD]
+  R[ReserveRegistry] -->|parámetros por activo| P
+  O[ReserveOracle] -->|precio y vigencia| R
+  U -->|solicitud| Q[RedemptionQueue]
+  Q -->|liquidación autorizada| P
+  S[BackstopPool] -->|recapitalización| P
+  P --> L[ObeliskLens]
+```
+
+Una posición deposita colateral admitido y acuña hasta el LTV configurado. El registro controla precio, cap de depósito, cap de emisión, ratio de liquidación y pesos de buckets. El pool usa el libro de deuda para saldos de posición y `LiquidityBuckets` para el orden de consumo de reservas. La cola asigna un ticket a cada solicitud de salida, con plazo mínimo de espera y vencimiento. El backstop es una fuente separada de recapitalización, sujeta a permisos y liquidez disponible.
+
+Las bibliotecas y el contrato `ReserveStressEngine` permiten calcular escenarios de cartera sin alterar estado. Son herramientas de lectura para seguimiento operativo, no sustituyen los controles transaccionales del pool.
 
 ## Modelo económico
 
-Los usuarios abren posiciones depositando un activo admitido y emiten `oUSD`
-hasta el LTV definido por el registro. El protocolo valida caps por activo,
-ratios visibles de reserva y salud de la posición antes de emitir. Los burns
-reducen deuda de una posición y liberan capacidad de retirada.
+Para un activo con `d` decimales y precio en WAD, `valor = (cantidad normalizada a 18 decimales × precio) / 10¹⁸`. La deuda máxima de una posición es `valor_colateral × LTV_bps / 10 000`. La emisión también comprueba el cap del activo y el objetivo de cobertura de reservas. Las salidas se cotizan al precio del registro, restan la comisión configurada y consumen buckets según el orden operativo.
 
-Las redenciones de `oUSD` se crean como tickets diferidos. Cuando el delay
-finaliza, el keeper o cualquier integración autorizada puede procesar los
-tickets contra los buckets disponibles. Las salidas aplican la comisión de
-redención registrada para el activo. La liquidez del backstop puede
-recapitalizar el reserve pool y se acredita en el bucket correspondiente.
+Ejemplo nominal: con 1 000 000 de rUSDC a precio 1 y LTV de 75 %, una posición puede acuñar hasta 750 000 `oUSD` antes de comisiones, siempre que el resto de controles permita la operación. Un objetivo de reserva de 12 500 bps exige al menos 1,25 unidades de valor de reserva por unidad de supply utilizada en la comprobación. El ejemplo no supone que un feed externo sea infalible ni modela costes de ejecución.
 
-## Seguridad y controles
+`ReserveStressEngine.assess` admite valores por activo y recortes en bps. Para valores 600 000/400 000, recortes 10 %/25 %, supply 600 000 y objetivo 15 000 bps, devuelve NAV estresado 840 000, ratio 14 000 bps y déficit hipotético 60 000 frente al objetivo. Es un escenario suministrado por el operador, no una valoración automática de mercado.
 
-- Separación de roles para administración, guardianes, keepers, riesgo,
-  asignación de liquidez, recapitalización y settlement.
-- Handover diferido para cambios de administración principal.
-- Validación de precio vigente, caps, LTV, deuda mínima y estado del activo.
-- Redenciones diferidas con delay, deadline y consumo ordenado de buckets.
-- Accounting por epoch para actividad de reserva, comisiones y recapitalización.
+Consulta [modelo económico](docs/modelo-economico.md) para unidades, redondeos y límites del cálculo.
 
-Consulta [SECURITY.md](./SECURITY.md) para el modelo de amenazas, alcance de
-revisión y proceso de reporte responsable.
+## Requisitos y validación
 
-## Requisitos
-
-- Foundry 1.7 o superior.
-- Solidity 0.8.28.
-- Bash o PowerShell para los wrappers de validación.
-
-## Comandos
+- Foundry 1.7 o superior y Solidity 0.8.28.
+- Bash para los scripts reproducibles. `scripts/bootstrap.sh` obtiene `forge-std` en la versión fijada si falta.
+- No se requiere un RPC externo para compilar y probar.
 
 ```bash
-forge build
-forge test -vvv
+bash scripts/tests.sh
 bash scripts/ci.sh
 ```
 
-En PowerShell:
+El CI comprueba formato, compila y ejecuta la suite Forge. El script de despliegue de `script/` sirve para entornos controlados; los tests crean contratos efímeros en la EVM local. Utiliza claves de prueba para los ejemplos locales.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File ./scripts/tests.ps1
-powershell -ExecutionPolicy Bypass -File ./scripts/ci.ps1
-```
+## Documentación
 
-## Despliegue local
+- [Arquitectura y límites de confianza](docs/arquitectura.md)
+- [Modelo económico y escenarios](docs/modelo-economico.md)
+- [Integración local](docs/integracion.md)
+- [Operación y conciliación](docs/operacion.md)
+- [Modelo de seguridad](docs/seguridad.md)
+- [Política de seguridad](SECURITY.md)
+- [Historial de cambios](CHANGELOG.md)
 
-El script espera una clave de despliegue y un activo de reserva ya desplegado:
-
-```bash
-PRIVATE_KEY=... RESERVE_ASSET=0x... forge script script/DeployObelisk.s.sol:DeployObelisk \
-  --rpc-url http://127.0.0.1:8545 --broadcast
-```
-
-`TREASURY` es opcional; si no se define, se usa el deployer.
-
-## Estructura
+## Estructura y release
 
 ```text
-src/
-  access/       roles y administración diferida
-  core/         pool principal, registro, accounting, fees y libro de deuda
-  governance/   timelock de parámetros
-  interfaces/   interfaces ERC-20 y settlement
-  lens/         vistas agregadas
-  libraries/    aritmética, porcentajes, buckets y redenciones
-  modules/      cola de redenciones
-  oracle/       precios de reserva
-  periphery/    router de keeper
-  pools/        buckets y backstop
-  token/        stablecoin del protocolo
-  types/        estructuras compartidas
-tests/          pruebas Forge de flujos públicos
-script/         despliegue Foundry
-scripts/        wrappers reproducibles de validación
+src/core/        pool, posiciones, registro, comisiones y contabilidad
+src/modules/     cola de redenciones
+src/pools/       buckets y backstop
+src/oracle/      precios y guardas
+src/lens/        vistas agregadas
+src/analytics/   escenarios puros de estrés
+tests/          pruebas de integración y analítica
+scripts/        bootstrap, tests y CI
+docs/           contratos operativos en español
 ```
 
-## Cobertura funcional
-
-La suite Forge cubre mint, burn, retirada de colateral, redenciones diferidas,
-cancelación, expiración, batch processing, rebalanceo de buckets y
-recapitalización desde backstop.
+Una publicación estable usa PR con CI verde, rama `production`, tag anotado `v1.0.0` y release `Production 1.0.0` sobre el mismo commit. El workflow de integridad comprueba esa convergencia. La palabra «Production» nombra el artefacto de código, no un despliegue on-chain.
